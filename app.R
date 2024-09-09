@@ -399,7 +399,14 @@ server <- function(input, output, session) {
       paste("allocation_table_", Sys.Date(), ".csv", sep = "")
     },
     content = function(file) {
-      write.csv(user_groups()$summarized, file, row.names = FALSE)
+      summarized_data <- user_groups()$summarized
+      
+      # Round numeric columns to 2 decimal places and ensure proper formatting
+      rounded_data <- summarized_data %>%
+        mutate(across(where(is.numeric), ~ format(round(., 2), nsmall = 2)))  # Round and format numeric columns
+      
+      # Write the rounded and formatted table to a CSV file
+      write.csv(rounded_data, file, row.names = FALSE, quote = TRUE)
     }
   )
   
