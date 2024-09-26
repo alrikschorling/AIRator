@@ -1,5 +1,8 @@
 # Load packages
-pacman::p_load(shiny, tidyverse, ggplot2, rstatix, ggprism, purrr, shinyFeedback, anticlust)
+pacman::p_load(shiny, shinythemes, shinyjs, shinyFeedback,
+               tidyverse, ggplot2, 
+               rstatix, ggprism, 
+               purrr, anticlust)
 
 # Set themes
 basic_theme <- theme_bw() + 
@@ -27,28 +30,80 @@ pal <- c("#B5B5B5", "#80607E", "#64D1C5", "#D1B856", "#8F845B", "#5C7C78", "#524
 
 # UI
 ui <- fluidPage(
-  useShinyFeedback(),  # Initialize shinyFeedback
-  titlePanel("Amphetamine-induced rotations processor"),
+  theme = shinytheme("flatly"),
+  
+  tags$head(
+    tags$style(HTML("
+      .btn-spacing {
+        margin-bottom: 5px; margin-right: 5px;
+      }
+    "))
+  ),
+  useShinyFeedback(),
+  useShinyjs(),
+  
+  tags$head(
+    tags$style(HTML("
+    .progress {
+      width: 100% !important;  /* Make the progress bar 100% width */
+      height: 30px !important;  /* Adjust the height of the progress bar */
+    }
+    .progress-bar {
+      font-size: 14px !important;  /* Increase the font size */
+      line-height: 30px !important;  /* Match the line height to the bar height to center text */
+      text-align: center !important;  /* Ensure the text is centered horizontally */
+    }
+  "))
+  ),
+  
+  
+  titlePanel("AIRator - amphetamine-induced rotations processor"),
   sidebarLayout(
     sidebarPanel(
+      
+      
+      helpText(HTML("Please upload a raw CSV file directly derived from the",
+                    "<a href='https://omnitech-usa.com/product/fusion-software/'>Fusion software</a>.",
+                    
+                    "The CSV files should be generated using the extended export, 60).<br><br>",
+                    
+                    "If the data was derived from RotoMax system in Copenhagen, the number of columns to",
+                    "skip is 22. Otherwise it should be 24.<br><br>",
+                    
+                    "The app processes the data in two modes:<br>",
+                    "<b>1. Allocation:</b> <br>",
+                    "Allocates rats in balanced groups using anticlustering with the following parameters:<br>",
+                    "- objective = kplus <br>",
+                    "- categories = lesion <br>",
+                    "- method = local-maximum <br>",
+                    "- repetitions = 100 <br><br>",
+                    
+                    "You can read more about the anticlustering packages <a href='https://cran.r-project.org/web/packages/anticlust/vignettes/anticlust.html'>here</a>.",
+                    
+                    "<br><br>",
+                    "<b>2. Analysis:</b> <br>",
+                    "Analyzes the data, visualizes the results, and generates publication-ready figures.",
+                    )),
+      
+      
       selectInput("mode", "Select Mode:", 
                   choices = c("Allocation" = "allocation", "Analysis" = "analysis")),
-      fileInput("file1", "Choose CSV Files", multiple = TRUE,
+      selectInput("skip_lines", "Number of lines to skip:", 
+                  choices = c(22, 24), selected = 22),
+      fileInput("file1", "Choose CSV file(s)", multiple = TRUE,
                 accept = c("text/csv",
                            "text/comma-separated-values,text/plain",
                            ".csv")),
-      selectInput("skip_lines", "Number of lines to skip:", 
-                  choices = c(22, 24), selected = 24),
       conditionalPanel(
         condition = "input.mode == 'allocation'",
-        numericInput("lesion_low", "Lesion boundary - Low (<= value)", 4.0, step = 0.1),
+        numericInput("lesion_low", "Lesion boundary - Low (<= value)", 3.8, step = 0.1),
         numericInput("lesion_mid", "Lesion boundary - Mid (<= value)", 8.0, step = 0.1),
         numericInput("lesion_high", "Lesion boundary - High (> value)", 12.0, step = 0.1),
         numericInput("num_groups", "Number of groups for anticlustering", 3),
         textInput("group_names_allocation", "Group names (comma-separated)", 
                   placeholder = "Group A, Group B, Group C"),  # Comma-separated input
-        actionButton("process_data", "Process Data"),
-        downloadButton("download_allocation", "Download Allocation Results")
+        actionButton("process_data", "Process data", class = "btn-spacing"),
+        downloadButton("download_allocation", "Download allocation table results", class = "btn-spacing")
         
       ),
       conditionalPanel(
@@ -59,14 +114,18 @@ ui <- fluidPage(
         uiOutput("week_input_ui"),  # Dynamic UI for week input
         actionButton("process_data_analysis", "Process Data")
       ),
-      downloadButton("downloadData1", "Download plot 1 - continuous data"),
-      downloadButton("downloadData2", "Download plot 2 - violin plot")
+      downloadButton("downloadData1", "Download Fig 1 - continuous data", class = "btn-spacing"),
+      downloadButton("downloadData2", "Download Fig 2 - groups", class = "btn-spacing"),
+      downloadButton("downloadData3", "Download Fig 3 - overall distribution", class = "btn-spacing"),
+      width = 6
+      
     ),
     mainPanel(
       tableOutput("data_dimensions"),  # Output dimensions of uploaded files
       uiOutput("allocation_table_ui"),  # UI output for allocation table
       plotOutput("plot1"),
-      plotOutput("plot2")
+      plotOutput("plot2"),
+      plotOutput("plot3")
     )
   )
 )
@@ -188,6 +247,8 @@ server <- function(input, output, session) {
     
     if (input$mode == "allocation") {
       # For Allocation Mode
+      
+      set.seed(69)  # Set seed for reproducibility
       summarized_data <- combined_data() %>%
         group_by(id) %>%
         summarise(mean_net_turns = mean(net_turns), 
@@ -206,7 +267,8 @@ server <- function(input, output, session) {
           method = "local-maximum",
           repetitions = 100
         ))) %>%
-        arrange(group, lesion)
+        arrange(group, lesion) |>
+        mutate(lesion = factor(lesion, levels = c("low", "mid", "high")))
       
       # Parse the comma-separated group names
       group_names <- strsplit(input$group_names_allocation, ",\\s*")[[1]]
@@ -215,7 +277,7 @@ server <- function(input, output, session) {
       if (length(group_names) != input$num_groups) {
         shinyFeedback::showFeedbackDanger(
           inputId = "group_names_allocation",
-          text = "Number of group names does not match the number of groups!"
+          text = "Group name and number mismatch"
         )
         return(NULL)
       }
@@ -239,7 +301,8 @@ server <- function(input, output, session) {
                   .groups = 'drop')
       
       combined_data_with_groups <- combined_data() %>%
-        left_join(summarized_data %>% select(week, group, mean_net_turns, sem), by = c("week", "group"))
+        left_join(summarized_data %>% select(week, group, mean_net_turns, sem), 
+                  by = c("week", "group"))
       
       return(list(analysis = combined_data_with_groups))
     }
@@ -285,7 +348,7 @@ server <- function(input, output, session) {
           scale_x_continuous(limit = c(0, 90), breaks = c(0, 30, 60, 90)) +
           scale_color_manual(values = setNames(colors, unique_groups)) +
           theme_1 +
-          labs(x = "Time (min)", y = "  Net turns \n (per min)", title = "Fig. 1 - continuous data (Allocation mode)") +
+          labs(x = "Time (min)", y = "  Net turns \n (per min)", title = "Fig 1. Continuous data") +
           theme(legend.position = "bottom")
         
         print(p1)
@@ -317,7 +380,7 @@ server <- function(input, output, session) {
             scale_x_continuous(limit = c(0, 90), breaks = c(0, 30, 60, 90)) +
             scale_color_manual(values = setNames(colors, unique_groups)) +
             theme_1 +
-            labs(x = "Time (min)", y = "  Net turns \n (per min)", title = "Fig. 1 - continuous data (Allocation mode)") +
+            labs(x = "Time (min)", y = "  Net turns \n (per min)", title = "Fig 1. Continuous data") +
             theme(legend.position = "bottom")
           
           print(p1)
@@ -349,7 +412,7 @@ server <- function(input, output, session) {
           scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2*max(summarized_data$mean_net_turns))) +
           scale_fill_manual(values = setNames(colors, unique_groups)) +
           theme_1 +
-          labs(x = "Group", y = "Mean net turns", title = "Fig. 2 - violin plot (Allocation mode)")
+          labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
         
         print(p2)
       }
@@ -381,7 +444,7 @@ server <- function(input, output, session) {
             scale_y_continuous(expand = c(0, 0)) +
             scale_fill_manual(values = setNames(colors, unique_groups)) +
             theme_1 +
-            labs(x = "Group", y = "Mean net turns", title = "Fig. 2 - violin plot (Allocation mode)")
+            labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
           
           print(p2)
         }
@@ -390,6 +453,78 @@ server <- function(input, output, session) {
       dev.off()  # Close PDF device
     }
   )
+  
+ 
+  
+  
+  
+  
+  #newly added plot 3
+  # Display plot3 in the UI
+  output$plot3 <- renderPlot({
+    req(user_groups())  # Make sure the data is ready
+    data_list <- user_groups()
+    
+    if (input$mode == "allocation") {
+      summarized_data <- data_list$summarized
+      
+      if (all(c("mean_net_turns", "group") %in% colnames(summarized_data))) {
+        
+        p3 <- ggplot(summarized_data, aes(x = 1, y = mean_net_turns)) +
+          geom_violin(fill = 'gray90') +
+          geom_point(aes(fill = lesion),
+                     position = position_jitter(width = 0.2),
+                     size = 4, shape = 21, stroke = 0.2, color = 'black') +
+          scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2*max(summarized_data$mean_net_turns))) +
+          scale_fill_manual(values = c('#DBF227', '#9FC131', '#005C53')) +
+          geom_hline(yintercept = c(input$lesion_low, input$lesion_mid, input$lesion_high), linetype = "dashed") +
+          theme_1 +
+          theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+          labs(x = "", y = "Mean net turns", title = "Fig 3. Lesion results")
+        
+        print(p3)
+      }
+    }
+  })
+  
+  # Download plot3 as PDF
+  output$downloadData3 <- downloadHandler(
+    filename = function() {
+      paste("violin_plot_", Sys.Date(), ".pdf", sep = "")
+    },
+    content = function(file) {
+      pdf(file, width = 3, height = 3)  # Open PDF device with size
+      plot2 <- isolate(user_groups())  # Fetch the data
+      data_list <- plot2
+      
+      if (input$mode == "allocation") {
+        summarized_data <- data_list$summarized
+        
+        if (all(c("mean_net_turns", "group") %in% colnames(summarized_data))) {
+          unique_groups <- unique(summarized_data$group)
+          colors <- pal[1:length(unique_groups)]
+          
+          p3 <- ggplot(summarized_data, aes(x = 1, y = mean_net_turns)) +
+            geom_violin(fill = 'gray90') +
+            geom_point(aes(fill = lesion),
+                       position = position_jitter(width = 0.2),
+                       size = 4, shape = 21, stroke = 0.2, color = 'black') +
+            scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2*max(summarized_data$mean_net_turns))) +
+            theme_1 +
+            scale_fill_manual(values = c('#DBF227', '#9FC131', '#005C53')) +
+            geom_hline(yintercept = c(input$lesion_low, input$lesion_mid, input$lesion_high), linetype = "dashed") +
+            theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+            labs(x = "", y = "Mean net turns", title = "Fig 3. Lesion results")
+          
+          print(p3)
+        }
+      }
+      
+      dev.off()  # Close PDF device
+    }
+  )
+  
+  
   
   
   
