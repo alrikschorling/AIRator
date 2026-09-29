@@ -106,6 +106,7 @@ ui <- fluidPage(
         numericInput("lesion_mid", "Lesion boundary - Mid (<= value)", 8.0, step = 0.1),
         helpText("Animals above the mid boundary are classified as \"high\"."),
         numericInput("num_groups", "Number of groups for anticlustering", 3),
+        numericInput("seed", "Random seed (for reproducibility)", 69),
         textInput("group_names_allocation", "Group names (comma-separated)", 
                   placeholder = "Group A, Group B, Group C"),  # Comma-separated input
         actionButton("process_data", "Process data", class = "btn-spacing"),
@@ -162,14 +163,14 @@ server <- function(input, output, session) {
         return(df)
       }, error = function(e) {
         shinyFeedback::showFeedbackDanger(
-          inputId = ifelse(input$mode == "allocation", "file1", "file1_analysis"),
+          inputId = "file1",
           text = paste("Error reading file:", filename, ":", e$message)
         )
         return(NULL)
       })
     } else {
       shinyFeedback::showFeedbackDanger(
-        inputId = ifelse(input$mode == "allocation", "file1", "file1_analysis"),
+        inputId = "file1",
         text = "File does not exist or is empty. Please ensure the file is downloaded and available."
       )
       return(NULL)
@@ -182,12 +183,16 @@ server <- function(input, output, session) {
     req(input$mode)
     req(input$file1)
     
+    #clear any feedback left over from a previous upload
+    shinyFeedback::hideFeedback("file1")
+
     data_files <- lapply(input$file1$datapath, read.func, skip_lines = input$skip_lines)
+    names(data_files) <- input$file1$name
     data_files <- Filter(Negate(is.null), data_files)
     
     if (length(data_files) == 0) {
       shinyFeedback::showFeedbackWarning(
-        inputId = ifelse(input$mode == "allocation", "file1", "file1_analysis"),
+        inputId = "file1",
         text = "No valid files were loaded. Please check your file selections."
       )
     }
@@ -198,17 +203,33 @@ server <- function(input, output, session) {
   # Reactive expression to combine all data frames into one
   combined_data <- reactive({
     req(data_list())
-    combined <- do.call(rbind, data_list())
-    
+    #bind_rows rather than rbind: it reports a readable error when files have
+    #mismatched columns instead of failing on a column-count mismatch
+    combined <- bind_rows(data_list())
+
     if (input$mode == "analysis") {
-      combined$week <- unlist(lapply(seq_along(data_list()), function(i) {
-        rep(input[[paste0("week_", i)]], nrow(data_list()[[i]]))
-      }))
-      
-      # Ensure group column exists
-      combined$group <- unlist(lapply(combined$id, function(id) {
-        input[[paste0("group_", id)]]
-      }))
+      files <- data_list()
+
+      #one week label per uploaded file, matched by file name so a file that
+      #failed to read does not shift every subsequent label
+      weeks <- vapply(seq_along(input$file1$name), function(i) {
+        w <- input[[paste0("week_", i)]]
+        if (is.null(w) || !nzchar(w)) NA_character_ else as.character(w)
+      }, character(1))
+      names(weeks) <- input$file1$name
+      combined$week <- rep(unname(weeks[names(files)]),
+                           vapply(files, nrow, integer(1)))
+
+      #Look each animal's group up through a named vector. unlist() silently
+      #drops NULLs for animals whose group is still unset, which leaves the
+      #column shorter than the data and then recycles. IDs are sanitised
+      #because they are interpolated into Shiny input ids.
+      ids <- unique(as.character(combined$id))
+      groups <- vapply(ids, function(id) {
+        g <- input[[paste0("group_", make.names(id))]]
+        if (is.null(g)) NA_character_ else as.character(g)
+      }, character(1))
+      combined$group <- unname(groups[match(as.character(combined$id), ids)])
     }
     
     combined
@@ -219,11 +240,13 @@ server <- function(input, output, session) {
     req(input$file1)
     if (input$mode == "analysis") {
       output$dynamic_group_ui <- renderUI({
-        ids <- unique(unlist(lapply(data_list(), function(df) df$id)))
+        ids <- unique(unlist(lapply(data_list(), function(df) as.character(df$id))))
         group_names <- strsplit(input$group_names, ",\\s*")[[1]]
         
         lapply(ids, function(id) {
-          selectInput(inputId = paste0("group_", id),
+          #make.names keeps ids containing spaces or punctuation from
+          #producing input ids that Shiny cannot bind to
+          selectInput(inputId = paste0("group_", make.names(id)),
                       label = paste("Group for", id),
                       choices = group_names,
                       selected = NULL)
@@ -242,6 +265,22 @@ server <- function(input, output, session) {
     }
   })
   
+  # Summary of what was actually read. A wrong "lines to skip" setting is the
+  # most common upload problem, and it shows up here as an obviously wrong row
+  # or animal count instead of a confusing error further downstream.
+  output$data_dimensions <- renderTable({
+    req(input$file1)
+    files <- data_list()
+    req(length(files) > 0)
+
+    data.frame(
+      File    = names(files),
+      Rows    = vapply(files, nrow, integer(1)),
+      Animals = vapply(files, function(d) length(unique(d$id)), integer(1)),
+      row.names = NULL, check.names = FALSE
+    )
+  })
+
   # Define function to calculate the standard error of the mean (SEM)
   sem_func <- function(turns) {
     sd(turns) / sqrt(length(turns))
@@ -254,7 +293,8 @@ server <- function(input, output, session) {
     if (input$mode == "allocation") {
       # For Allocation Mode
       
-      set.seed(69)  # Set seed for reproducibility
+      req(input$seed)
+      set.seed(input$seed)  # fixed seed makes an allocation reproducible
       summarized_data <- combined_data() %>%
         group_by(id) %>%
         summarise(mean_net_turns = mean(net_turns), 
@@ -331,14 +371,6 @@ server <- function(input, output, session) {
     user_groups()$summarized
   })
   
-  # Debugging output to check structure of user_groups
-  output$debug_user_groups <- renderPrint({
-    req(user_groups())
-    str(user_groups())
-  })
-  
-  
-  
   # ---- Figures -----------------------------------------------------------
   # Each figure is built exactly once here and consumed by both the on-screen
   # output and the PDF download, so a downloaded file can never drift from the
@@ -356,7 +388,9 @@ server <- function(input, output, session) {
       geom_point(alpha = 0.3, size = 2) +
       geom_smooth(method = "loess", se = FALSE) +
       facet_wrap(~id, scale = "free", drop = FALSE) +
-      scale_x_continuous(limit = c(0, 90), breaks = c(0, 30, 60, 90)) +
+      #breaks every 30 min, but no hard upper limit: a fixed c(0, 90) silently
+      #dropped any data from a session longer than 90 minutes
+      scale_x_continuous(breaks = seq(0, max(original_data$min, na.rm = TRUE), by = 30)) +
       scale_color_manual(values = setNames(colors, unique_groups)) +
       theme_1 +
       labs(x = "Time (min)", y = "  Net turns \n (per min)",
