@@ -1,0 +1,7 @@
+# Files kept in the repository but not needed by the running app.
+# Applies to rsconnect bundles and to the file list in manifest.json.
+.github
+docs
+tests
+data-raw
+example-data
