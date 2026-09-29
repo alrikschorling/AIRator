@@ -1,8 +1,14 @@
 # Load packages
-pacman::p_load(shiny, shinythemes, shinyjs, shinyFeedback,
-               tidyverse, ggplot2, 
-               rstatix, ggprism, 
-               purrr, anticlust)
+# Declared explicitly rather than via pacman::p_load() so that dependencies are
+# discoverable by renv/rsconnect and nothing is installed at runtime on the
+# server. rstatix, ggprism and purrr were declared previously but never used.
+library(shiny)          # app framework
+library(shinythemes)    # bootswatch themes
+library(shinyjs)        # enable/disable controls
+library(shinyFeedback)  # inline input validation
+library(dplyr)          # data manipulation
+library(ggplot2)        # plotting
+library(anticlust)      # balanced group allocation
 
 # Set themes
 basic_theme <- theme_bw() + 
@@ -98,8 +104,9 @@ ui <- fluidPage(
         condition = "input.mode == 'allocation'",
         numericInput("lesion_low", "Lesion boundary - Low (<= value)", 3.8, step = 0.1),
         numericInput("lesion_mid", "Lesion boundary - Mid (<= value)", 8.0, step = 0.1),
-        numericInput("lesion_high", "Lesion boundary - High (> value)", 12.0, step = 0.1),
+        helpText("Animals above the mid boundary are classified as \"high\"."),
         numericInput("num_groups", "Number of groups for anticlustering", 3),
+        numericInput("seed", "Random seed (for reproducibility)", 69),
         textInput("group_names_allocation", "Group names (comma-separated)", 
                   placeholder = "Group A, Group B, Group C"),  # Comma-separated input
         actionButton("process_data", "Process data", class = "btn-spacing"),
@@ -156,14 +163,14 @@ server <- function(input, output, session) {
         return(df)
       }, error = function(e) {
         shinyFeedback::showFeedbackDanger(
-          inputId = ifelse(input$mode == "allocation", "file1", "file1_analysis"),
+          inputId = "file1",
           text = paste("Error reading file:", filename, ":", e$message)
         )
         return(NULL)
       })
     } else {
       shinyFeedback::showFeedbackDanger(
-        inputId = ifelse(input$mode == "allocation", "file1", "file1_analysis"),
+        inputId = "file1",
         text = "File does not exist or is empty. Please ensure the file is downloaded and available."
       )
       return(NULL)
@@ -176,12 +183,16 @@ server <- function(input, output, session) {
     req(input$mode)
     req(input$file1)
     
+    #clear any feedback left over from a previous upload
+    shinyFeedback::hideFeedback("file1")
+
     data_files <- lapply(input$file1$datapath, read.func, skip_lines = input$skip_lines)
+    names(data_files) <- input$file1$name
     data_files <- Filter(Negate(is.null), data_files)
     
     if (length(data_files) == 0) {
       shinyFeedback::showFeedbackWarning(
-        inputId = ifelse(input$mode == "allocation", "file1", "file1_analysis"),
+        inputId = "file1",
         text = "No valid files were loaded. Please check your file selections."
       )
     }
@@ -192,17 +203,33 @@ server <- function(input, output, session) {
   # Reactive expression to combine all data frames into one
   combined_data <- reactive({
     req(data_list())
-    combined <- do.call(rbind, data_list())
-    
+    #bind_rows rather than rbind: it reports a readable error when files have
+    #mismatched columns instead of failing on a column-count mismatch
+    combined <- bind_rows(data_list())
+
     if (input$mode == "analysis") {
-      combined$week <- unlist(lapply(seq_along(data_list()), function(i) {
-        rep(input[[paste0("week_", i)]], nrow(data_list()[[i]]))
-      }))
-      
-      # Ensure group column exists
-      combined$group <- unlist(lapply(combined$id, function(id) {
-        input[[paste0("group_", id)]]
-      }))
+      files <- data_list()
+
+      #one week label per uploaded file, matched by file name so a file that
+      #failed to read does not shift every subsequent label
+      weeks <- vapply(seq_along(input$file1$name), function(i) {
+        w <- input[[paste0("week_", i)]]
+        if (is.null(w) || !nzchar(w)) NA_character_ else as.character(w)
+      }, character(1))
+      names(weeks) <- input$file1$name
+      combined$week <- rep(unname(weeks[names(files)]),
+                           vapply(files, nrow, integer(1)))
+
+      #Look each animal's group up through a named vector. unlist() silently
+      #drops NULLs for animals whose group is still unset, which leaves the
+      #column shorter than the data and then recycles. IDs are sanitised
+      #because they are interpolated into Shiny input ids.
+      ids <- unique(as.character(combined$id))
+      groups <- vapply(ids, function(id) {
+        g <- input[[paste0("group_", make.names(id))]]
+        if (is.null(g)) NA_character_ else as.character(g)
+      }, character(1))
+      combined$group <- unname(groups[match(as.character(combined$id), ids)])
     }
     
     combined
@@ -213,11 +240,13 @@ server <- function(input, output, session) {
     req(input$file1)
     if (input$mode == "analysis") {
       output$dynamic_group_ui <- renderUI({
-        ids <- unique(unlist(lapply(data_list(), function(df) df$id)))
+        ids <- unique(unlist(lapply(data_list(), function(df) as.character(df$id))))
         group_names <- strsplit(input$group_names, ",\\s*")[[1]]
         
         lapply(ids, function(id) {
-          selectInput(inputId = paste0("group_", id),
+          #make.names keeps ids containing spaces or punctuation from
+          #producing input ids that Shiny cannot bind to
+          selectInput(inputId = paste0("group_", make.names(id)),
                       label = paste("Group for", id),
                       choices = group_names,
                       selected = NULL)
@@ -236,6 +265,22 @@ server <- function(input, output, session) {
     }
   })
   
+  # Summary of what was actually read. A wrong "lines to skip" setting is the
+  # most common upload problem, and it shows up here as an obviously wrong row
+  # or animal count instead of a confusing error further downstream.
+  output$data_dimensions <- renderTable({
+    req(input$file1)
+    files <- data_list()
+    req(length(files) > 0)
+
+    data.frame(
+      File    = names(files),
+      Rows    = vapply(files, nrow, integer(1)),
+      Animals = vapply(files, function(d) length(unique(d$id)), integer(1)),
+      row.names = NULL, check.names = FALSE
+    )
+  })
+
   # Define function to calculate the standard error of the mean (SEM)
   sem_func <- function(turns) {
     sd(turns) / sqrt(length(turns))
@@ -248,16 +293,19 @@ server <- function(input, output, session) {
     if (input$mode == "allocation") {
       # For Allocation Mode
       
-      set.seed(69)  # Set seed for reproducibility
+      req(input$seed)
+      set.seed(input$seed)  # fixed seed makes an allocation reproducible
       summarized_data <- combined_data() %>%
         group_by(id) %>%
         summarise(mean_net_turns = mean(net_turns), 
                   sem = sem_func(net_turns), 
                   .groups = 'drop') %>%
+        # Three ordered bins. "high" is everything above the mid boundary --
+        # there is deliberately no separate upper cut-off.
         mutate(lesion = case_when(
           mean_net_turns <= input$lesion_low ~ "low",
           mean_net_turns <= input$lesion_mid ~ "mid",
-          mean_net_turns > input$lesion_mid ~ "high"
+          TRUE                               ~ "high"
         )) %>%
         mutate(group = factor(anticlustering(
           mean_net_turns,
@@ -267,8 +315,10 @@ server <- function(input, output, session) {
           method = "local-maximum",
           repetitions = 100
         ))) %>%
-        arrange(group, lesion) |>
-        mutate(lesion = factor(lesion, levels = c("low", "mid", "high")))
+        # set the factor levels BEFORE arranging, otherwise rows sort
+        # alphabetically (high, low, mid) instead of by severity
+        mutate(lesion = factor(lesion, levels = c("low", "mid", "high"))) |>
+        arrange(group, lesion)
       
       # Parse the comma-separated group names
       group_names <- strsplit(input$group_names_allocation, ",\\s*")[[1]]
@@ -321,213 +371,104 @@ server <- function(input, output, session) {
     user_groups()$summarized
   })
   
-  # Debugging output to check structure of user_groups
-  output$debug_user_groups <- renderPrint({
-    req(user_groups())
-    str(user_groups())
+  # ---- Figures -----------------------------------------------------------
+  # Each figure is built exactly once here and consumed by both the on-screen
+  # output and the PDF download, so a downloaded file can never drift from the
+  # figure that was reviewed on screen.
+
+  plot1_obj <- reactive({
+    if (input$mode != "allocation") return(NULL)
+    original_data <- user_groups()$original
+    if (!all(c("min", "net_turns", "id", "group") %in% colnames(original_data))) return(NULL)
+
+    unique_groups <- unique(original_data$group)
+    colors <- pal[seq_along(unique_groups)]
+
+    ggplot(original_data, aes(x = min, y = net_turns, color = group)) +
+      geom_point(alpha = 0.3, size = 2) +
+      geom_smooth(method = "loess", se = FALSE) +
+      facet_wrap(~id, scale = "free", drop = FALSE) +
+      #breaks every 30 min, but no hard upper limit: a fixed c(0, 90) silently
+      #dropped any data from a session longer than 90 minutes
+      scale_x_continuous(breaks = seq(0, max(original_data$min, na.rm = TRUE), by = 30)) +
+      scale_color_manual(values = setNames(colors, unique_groups)) +
+      theme_1 +
+      labs(x = "Time (min)", y = "  Net turns \n (per min)",
+           title = "Fig 1. Continuous data") +
+      theme(legend.position = "bottom")
   })
-  
-  
-  
-  # Display plot1 in the UI
-  output$plot1 <- renderPlot({
-    req(user_groups())  # Make sure the data is ready
-    data_list <- user_groups()
-    
-    if (input$mode == "allocation") {
-      original_data <- data_list$original
-      
-      if (all(c("min", "net_turns", "id", "group") %in% colnames(original_data))) {
-        unique_groups <- unique(original_data$group)
-        colors <- pal[1:length(unique_groups)]
-        
-        p1 <- ggplot(original_data, aes(x = min, y = net_turns, color = group)) +
-          geom_point(alpha = 0.3, size = 2) +
-          geom_smooth(method = 'loess', se = FALSE) +
-          facet_wrap(~id, scale = 'free', drop = FALSE) +
-          scale_x_continuous(limit = c(0, 90), breaks = c(0, 30, 60, 90)) +
-          scale_color_manual(values = setNames(colors, unique_groups)) +
-          theme_1 +
-          labs(x = "Time (min)", y = "  Net turns \n (per min)", title = "Fig 1. Continuous data") +
-          theme(legend.position = "bottom")
-        
-        print(p1)
-      }
-    }
+
+  plot2_obj <- reactive({
+    if (input$mode != "allocation") return(NULL)
+    summarized_data <- user_groups()$summarized
+    if (!all(c("mean_net_turns", "group") %in% colnames(summarized_data))) return(NULL)
+
+    unique_groups <- unique(summarized_data$group)
+    colors <- pal[seq_along(unique_groups)]
+
+    ggplot(summarized_data, aes(x = group, y = mean_net_turns, fill = group)) +
+      geom_violin() +
+      # alpha is a fixed setting, not a mapping -- keeping it outside aes()
+      # avoids a spurious "0.8" legend entry
+      geom_point(position = position_jitter(width = 0.2),
+                 size = 4, shape = 21, stroke = 0.2,
+                 fill = "white", color = "black", alpha = 0.8) +
+      scale_y_continuous(expand = c(0, 0),
+                         limits = c(0, 1.2 * max(summarized_data$mean_net_turns))) +
+      scale_fill_manual(values = setNames(colors, unique_groups)) +
+      theme_1 +
+      labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
   })
-  
-  # Download plot1 as PDF
-  output$downloadData1 <- downloadHandler(
-    filename = function() {
-      paste("continuous_data_plot_", Sys.Date(), ".pdf", sep = "")
-    },
-    content = function(file) {
-      pdf(file, width = 8, height = 6)  # Open PDF device with size
-      plot1 <- isolate(user_groups())  # Fetch the data
-      data_list <- plot1
-      
-      if (input$mode == "allocation") {
-        original_data <- data_list$original
-        
-        if (all(c("min", "net_turns", "id", "group") %in% colnames(original_data))) {
-          unique_groups <- unique(original_data$group)
-          colors <- pal[1:length(unique_groups)]
-          
-          p1 <- ggplot(original_data, aes(x = min, y = net_turns, color = group)) +
-            geom_point(alpha = 0.3, size = 2) +
-            geom_smooth(method = 'loess', se = FALSE) +
-            facet_wrap(~id, scale = 'free', drop = FALSE) +
-            scale_x_continuous(limit = c(0, 90), breaks = c(0, 30, 60, 90)) +
-            scale_color_manual(values = setNames(colors, unique_groups)) +
-            theme_1 +
-            labs(x = "Time (min)", y = "  Net turns \n (per min)", title = "Fig 1. Continuous data") +
-            theme(legend.position = "bottom")
-          
-          print(p1)
-        }
-      }
-      
-      dev.off()  # Close PDF device
-    }
-  )
-  
-  
-  # Display plot2 in the UI
-  output$plot2 <- renderPlot({
-    req(user_groups())  # Make sure the data is ready
-    data_list <- user_groups()
-    
-    if (input$mode == "allocation") {
-      summarized_data <- data_list$summarized
-      
-      if (all(c("mean_net_turns", "group") %in% colnames(summarized_data))) {
-        unique_groups <- unique(summarized_data$group)
-        colors <- pal[1:length(unique_groups)]
-        
-        p2 <- ggplot(summarized_data, aes(x = group, y = mean_net_turns, fill = group)) +
-          geom_violin() +
-          geom_point(aes(alpha = 0.8),
-                     position = position_jitter(width = 0.2),
-                     size = 4, shape = 21, stroke = 0.2, fill = 'white', color = 'black') +
-          scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2*max(summarized_data$mean_net_turns))) +
-          scale_fill_manual(values = setNames(colors, unique_groups)) +
-          theme_1 +
-          labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
-        
-        print(p2)
-      }
-    }
+
+  plot3_obj <- reactive({
+    if (input$mode != "allocation") return(NULL)
+    summarized_data <- user_groups()$summarized
+    if (!all(c("mean_net_turns", "lesion") %in% colnames(summarized_data))) return(NULL)
+
+    ggplot(summarized_data, aes(x = 1, y = mean_net_turns)) +
+      geom_violin(fill = "gray90") +
+      geom_point(aes(fill = lesion),
+                 position = position_jitter(width = 0.2),
+                 size = 4, shape = 21, stroke = 0.2, color = "black") +
+      scale_y_continuous(expand = c(0, 0),
+                         limits = c(0, 1.2 * max(summarized_data$mean_net_turns))) +
+      # named so the colours stay attached to the right bin even when a
+      # category happens to be empty
+      scale_fill_manual(values = c(low = "#DBF227", mid = "#9FC131", high = "#005C53")) +
+      geom_hline(yintercept = c(input$lesion_low, input$lesion_mid), linetype = "dashed") +
+      theme_1 +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+      labs(x = "", y = "Mean net turns", title = "Fig 3. Lesion results")
   })
-  
-  # Download plot2 as PDF
-  output$downloadData2 <- downloadHandler(
-    filename = function() {
-      paste("violin_plot_", Sys.Date(), ".pdf", sep = "")
-    },
-    content = function(file) {
-      pdf(file, width = 4, height = 3)  # Open PDF device with size
-      plot2 <- isolate(user_groups())  # Fetch the data
-      data_list <- plot2
-      
-      if (input$mode == "allocation") {
-        summarized_data <- data_list$summarized
-        
-        if (all(c("mean_net_turns", "group") %in% colnames(summarized_data))) {
-          unique_groups <- unique(summarized_data$group)
-          colors <- pal[1:length(unique_groups)]
-          
-          p2 <- ggplot(summarized_data, aes(x = group, y = mean_net_turns, fill = group)) +
-            geom_violin() +
-            geom_point(aes(alpha = 0.8),
-                       position = position_jitter(width = 0.2),
-                       size = 4, shape = 21, stroke = 0.2, fill = 'white', color = 'black') +
-            scale_y_continuous(expand = c(0, 0)) +
-            scale_fill_manual(values = setNames(colors, unique_groups)) +
-            theme_1 +
-            labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
-          
-          print(p2)
-        }
+
+  #on-screen figures
+  output$plot1 <- renderPlot(plot1_obj())
+  output$plot2 <- renderPlot(plot2_obj())
+  output$plot3 <- renderPlot(plot3_obj())
+
+  #figure downloads are only meaningful once the data has been processed
+  figure_buttons <- c("downloadData1", "downloadData2", "downloadData3")
+  lapply(figure_buttons, shinyjs::disable)
+  observeEvent(plot1_obj(), lapply(figure_buttons, shinyjs::enable), ignoreNULL = TRUE)
+
+  #build a PDF download handler for a given figure and page size
+  pdf_download <- function(prefix, plot_reactive, width, height) {
+    downloadHandler(
+      filename = function() paste0(prefix, "_", Sys.Date(), ".pdf"),
+      content = function(file) {
+        p <- isolate(plot_reactive())
+        validate(need(!is.null(p),
+                      "Nothing to download yet - process the data first."))
+        ggsave(file, plot = p, device = "pdf",
+               width = width, height = height, units = "in")
       }
-      
-      dev.off()  # Close PDF device
-    }
-  )
-  
- 
-  
-  
-  
-  
-  #newly added plot 3
-  # Display plot3 in the UI
-  output$plot3 <- renderPlot({
-    req(user_groups())  # Make sure the data is ready
-    data_list <- user_groups()
-    
-    if (input$mode == "allocation") {
-      summarized_data <- data_list$summarized
-      
-      if (all(c("mean_net_turns", "group") %in% colnames(summarized_data))) {
-        
-        p3 <- ggplot(summarized_data, aes(x = 1, y = mean_net_turns)) +
-          geom_violin(fill = 'gray90') +
-          geom_point(aes(fill = lesion),
-                     position = position_jitter(width = 0.2),
-                     size = 4, shape = 21, stroke = 0.2, color = 'black') +
-          scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2*max(summarized_data$mean_net_turns))) +
-          scale_fill_manual(values = c('#DBF227', '#9FC131', '#005C53')) +
-          geom_hline(yintercept = c(input$lesion_low, input$lesion_mid, input$lesion_high), linetype = "dashed") +
-          theme_1 +
-          theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
-          labs(x = "", y = "Mean net turns", title = "Fig 3. Lesion results")
-        
-        print(p3)
-      }
-    }
-  })
-  
-  # Download plot3 as PDF
-  output$downloadData3 <- downloadHandler(
-    filename = function() {
-      paste("violin_plot_", Sys.Date(), ".pdf", sep = "")
-    },
-    content = function(file) {
-      pdf(file, width = 3, height = 3)  # Open PDF device with size
-      plot2 <- isolate(user_groups())  # Fetch the data
-      data_list <- plot2
-      
-      if (input$mode == "allocation") {
-        summarized_data <- data_list$summarized
-        
-        if (all(c("mean_net_turns", "group") %in% colnames(summarized_data))) {
-          unique_groups <- unique(summarized_data$group)
-          colors <- pal[1:length(unique_groups)]
-          
-          p3 <- ggplot(summarized_data, aes(x = 1, y = mean_net_turns)) +
-            geom_violin(fill = 'gray90') +
-            geom_point(aes(fill = lesion),
-                       position = position_jitter(width = 0.2),
-                       size = 4, shape = 21, stroke = 0.2, color = 'black') +
-            scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2*max(summarized_data$mean_net_turns))) +
-            theme_1 +
-            scale_fill_manual(values = c('#DBF227', '#9FC131', '#005C53')) +
-            geom_hline(yintercept = c(input$lesion_low, input$lesion_mid, input$lesion_high), linetype = "dashed") +
-            theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
-            labs(x = "", y = "Mean net turns", title = "Fig 3. Lesion results")
-          
-          print(p3)
-        }
-      }
-      
-      dev.off()  # Close PDF device
-    }
-  )
-  
-  
-  
-  
-  
+    )
+  }
+
+  output$downloadData1 <- pdf_download("continuous_data_plot", plot1_obj, 8, 6)
+  output$downloadData2 <- pdf_download("allocation_groups",    plot2_obj, 4, 3)
+  output$downloadData3 <- pdf_download("lesion_results",       plot3_obj, 3, 3)
+
   # Download allocation table as CSV
   output$download_allocation <- downloadHandler(
     filename = function() {

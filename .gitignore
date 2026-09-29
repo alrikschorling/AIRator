@@ -3,3 +3,14 @@
 .RData
 .Ruserdata
 rsconnect/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# renv: keep renv.lock, renv/activate.R and renv/settings.json;
+# the library itself is machine-specific (also covered by renv/.gitignore)
+renv/library/
+renv/local/
+renv/staging/
+renv/sandbox/
