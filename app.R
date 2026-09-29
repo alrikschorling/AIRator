@@ -584,6 +584,21 @@ server <- function(input, output, session) {
   # output and the PDF download, so a downloaded file can never drift from the
   # figure that was reviewed on screen.
 
+  #Anchor the y axis at zero only when every value is non-negative. Real Fusion
+  #exports do contain animals with a negative mean net turns, and a hard
+  #limits = c(0, ...) dropped them from the figure entirely: they stayed in the
+  #allocation table but vanished from the plot, and the violin was then shaped
+  #by the remaining animals only.
+  zero_anchored_y <- function(values) {
+    if (min(values, na.rm = TRUE) >= 0) {
+      #sits exactly on zero, as before
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, NA))
+    } else {
+      #negatives present: let the axis find its own range rather than clip them
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+    }
+  }
+
   #colours for a set of group levels
   group_colors <- function(groups) setNames(pal[seq_along(groups)], groups)
 
@@ -675,8 +690,7 @@ server <- function(input, output, session) {
       geom_point(position = position_jitter(width = 0.2),
                  size = 4, shape = 21, stroke = 0.2,
                  fill = "white", color = "black", alpha = 0.8) +
-      scale_y_continuous(expand = c(0, 0),
-                         limits = c(0, 1.2 * max(summarized_data$mean_net_turns))) +
+      zero_anchored_y(summarized_data$mean_net_turns) +
       scale_fill_manual(values = setNames(colors, unique_groups)) +
       theme_1 +
       labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
@@ -716,8 +730,7 @@ server <- function(input, output, session) {
       geom_point(aes(fill = lesion),
                  position = position_jitter(width = 0.2),
                  size = 4, shape = 21, stroke = 0.2, color = "black") +
-      scale_y_continuous(expand = c(0, 0),
-                         limits = c(0, 1.2 * max(summarized_data$mean_net_turns))) +
+      zero_anchored_y(summarized_data$mean_net_turns) +
       # named so the colours stay attached to the right bin even when a
       # category happens to be empty
       scale_fill_manual(values = c(low = "#DBF227", mid = "#9FC131", high = "#005C53")) +
