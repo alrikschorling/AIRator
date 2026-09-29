@@ -70,9 +70,58 @@ marked.
 
 ## Analysis mode
 
-> **Known limitation.** Analysis mode currently computes per-week, per-group
-> summaries but does not yet render any figures or tables — the three plots are
-> produced for allocation mode only. Use allocation mode for now.
+Compares treatment groups over time. Upload **one file per timepoint**, label
+each file with its week, and assign every animal to a group.
+
+Each animal contributes **one value per week** — its mean net turns across the
+session. That is the unit of analysis, so error bars show variation between
+animals. (Summarising directly from the per-minute rows would treat every
+minute as an independent observation and understate the SEM roughly sevenfold
+for a 90-minute session.)
+
+Weeks are ordered by upload order rather than alphabetically, so `w2` sorts
+before `w10`.
+
+### Group comparison
+
+Within each week the groups are compared, and the test is chosen from the data.
+Normality is assessed on the within-group residuals — the assumption the t-test
+and ANOVA actually make — and equality of variance with Levene's test:
+
+| Residuals | Variance | Groups | Method |
+| --------- | -------- | ------ | ------ |
+| non-normal | — | 2 | Wilcoxon rank-sum |
+| non-normal | — | 3+ | Dunn's test (BH-adjusted) |
+| normal | unequal | 2 | Welch's t-test |
+| normal | unequal | 3+ | Games-Howell |
+| normal | equal | 2 | Student's t-test |
+| normal | equal | 3+ | ANOVA + Tukey HSD |
+
+The app reports which test it used for each week. Each week is decided
+independently, so different weeks may use different tests.
+
+> Weeks are compared **independently**. This does not model the correlation
+> between repeated measurements on the same animal — if you need a
+> week × group interaction term, fit a repeated-measures model on the exported
+> summary.
+
+### Outputs
+
+| Output | Contents |
+| ------ | -------- |
+| Analysis summary (CSV) | per week and group: n, mean net turns, SEM, plus every pairwise test |
+| Fig 1 (PDF) | session time course, group mean ± SEM, faceted by week |
+| Fig 2 (PDF) | per-week group comparison with p-values |
+| Fig 3 (PDF) | response over weeks, with individual animal trajectories |
+
+### Example output
+
+A 12-animal, 3-week test dataset in which the treated group improves while the
+vehicle group does not.
+
+![Per-week group comparison](docs/example-week-comparison.png)
+
+![Response over weeks](docs/example-over-weeks.png)
 
 ## Running locally
 
