@@ -1,7 +1,7 @@
 # Load packages
 # Declared explicitly rather than via pacman::p_load() so that dependencies are
 # discoverable by renv/rsconnect and nothing is installed at runtime on the
-# server. rstatix, ggprism and purrr were declared previously but never used.
+# server.
 library(shiny)          # app framework
 library(shinythemes)    # bootswatch themes
 library(shinyjs)        # enable/disable controls
@@ -9,6 +9,8 @@ library(shinyFeedback)  # inline input validation
 library(dplyr)          # data manipulation
 library(ggplot2)        # plotting
 library(anticlust)      # balanced group allocation
+library(rstatix)        # per-week group comparisons in analysis mode
+library(ggprism)        # add_pvalue()
 
 # Set themes
 basic_theme <- theme_bw() + 
@@ -88,7 +90,14 @@ ui <- fluidPage(
                     
                     "<br><br>",
                     "<b>2. Analysis:</b> <br>",
-                    "Analyzes the data, visualizes the results, and generates publication-ready figures.",
+                    "Compares treatment groups over time. Upload one file per timepoint, label each",
+                    "file with its week and assign every animal to a group.<br>",
+                    "Each animal contributes one value per week (its mean net turns over the session),",
+                    "so error bars reflect variation between animals rather than between minutes.<br>",
+                    "Within each week the groups are compared, with the test chosen from the data:<br>",
+                    "- non-normal residuals: Wilcoxon (2 groups) or Dunn, BH-adjusted (3+)<br>",
+                    "- unequal variance: Welch (2 groups) or Games-Howell (3+)<br>",
+                    "- otherwise: Student t-test (2 groups) or ANOVA + Tukey HSD (3+)",
                     )),
       
       
@@ -119,17 +128,28 @@ ui <- fluidPage(
                   placeholder = "Group A, Group B, Group C"),
         uiOutput("dynamic_group_ui"),
         uiOutput("week_input_ui"),  # Dynamic UI for week input
-        actionButton("process_data_analysis", "Process Data")
+        actionButton("process_data_analysis", "Process data", class = "btn-spacing"),
+        downloadButton("download_analysis", "Download analysis summary", class = "btn-spacing")
       ),
-      downloadButton("downloadData1", "Download Fig 1 - continuous data", class = "btn-spacing"),
-      downloadButton("downloadData2", "Download Fig 2 - groups", class = "btn-spacing"),
-      downloadButton("downloadData3", "Download Fig 3 - overall distribution", class = "btn-spacing"),
+      conditionalPanel(
+        condition = "input.mode == 'allocation'",
+        helpText(HTML("<b>Fig 1</b> continuous data &middot; <b>Fig 2</b> allocation groups",
+                      "&middot; <b>Fig 3</b> lesion results"))),
+      conditionalPanel(
+        condition = "input.mode == 'analysis'",
+        helpText(HTML("<b>Fig 1</b> session time course &middot; <b>Fig 2</b> group comparison per week",
+                      "&middot; <b>Fig 3</b> response over weeks"))),
+      downloadButton("downloadData1", "Download Fig 1", class = "btn-spacing"),
+      downloadButton("downloadData2", "Download Fig 2", class = "btn-spacing"),
+      downloadButton("downloadData3", "Download Fig 3", class = "btn-spacing"),
       width = 6
       
     ),
     mainPanel(
       tableOutput("data_dimensions"),  # Output dimensions of uploaded files
       uiOutput("allocation_table_ui"),  # UI output for allocation table
+      uiOutput("analysis_table_ui"),    # UI output for analysis summary
+      verbatimTextOutput("analysis_tests"),
       plotOutput("plot1"),
       plotOutput("plot2"),
       plotOutput("plot3")
@@ -283,11 +303,32 @@ server <- function(input, output, session) {
 
   # Define function to calculate the standard error of the mean (SEM)
   sem_func <- function(turns) {
+    turns <- turns[!is.na(turns)]
+    if (length(turns) < 2) return(NA_real_)
     sd(turns) / sqrt(length(turns))
   }
+
+  # Week labels in the order the files were uploaded. Weeks are free text, so
+  # sorting them would put "w10" before "w2"; upload order is the chronological
+  # order the user intends.
+  week_levels <- reactive({
+    req(input$file1)
+    ws <- vapply(seq_along(input$file1$name), function(i) {
+      w <- input[[paste0("week_", i)]]
+      if (is.null(w) || !nzchar(w)) NA_character_ else as.character(w)
+    }, character(1))
+    unique(ws[!is.na(ws)])
+  })
+
+  # Group names for analysis mode, in the order the user typed them
+  analysis_group_names <- reactive({
+    gn <- strsplit(input$group_names %||% "", ",\\s*")[[1]]
+    gn[nzchar(gn)]
+  })
   
   # Reactive expression to generate user groups
-  user_groups <- eventReactive(c(input$process_data, input$mode), {
+  user_groups <- eventReactive(
+    c(input$process_data, input$process_data_analysis, input$mode), {
     req(combined_data())
     
     if (input$mode == "allocation") {
@@ -343,24 +384,151 @@ server <- function(input, output, session) {
       return(list(summarized = summarized_data, original = original_data_with_groups))
       
     } else if (input$mode == "analysis") {
-      # For Analysis Mode
-      summarized_data <- combined_data() %>%
+      d <- combined_data()
+
+      validate(
+        need(length(analysis_group_names()) >= 1,
+             "Enter the group names first (comma-separated)."),
+        need(length(week_levels()) >= 1,
+             "Give every uploaded file a week label."),
+        need(!anyNA(d$week),
+             "Every uploaded file needs a week label before the data can be analysed."),
+        need(!anyNA(d$group),
+             "Every animal needs to be assigned to a group before the data can be analysed.")
+      )
+
+      d <- d %>%
+        mutate(week  = factor(week,  levels = week_levels()),
+               group = factor(group, levels = analysis_group_names()))
+
+      # One value per animal per week: the mean over that animal's session.
+      # This is the unit of analysis. Summarising straight from the per-minute
+      # rows would treat every minute as an independent observation and
+      # understate the SEM several-fold.
+      per_animal <- d %>%
+        group_by(week, group, id) %>%
+        summarise(mean_net_turns = mean(net_turns, na.rm = TRUE), .groups = "drop")
+
+      # Group-level summary, with the SEM taken across ANIMALS
+      # NOTE: summarise() evaluates its arguments in order and later ones see
+      # the earlier results, so sem must be computed BEFORE mean_net_turns is
+      # overwritten -- otherwise sem_func() receives the scalar mean rather
+      # than the column, and every SEM comes out NA.
+      per_group <- per_animal %>%
         group_by(week, group) %>%
-        summarise(mean_net_turns = mean(net_turns), 
-                  sem = sem_func(net_turns), 
-                  .groups = 'drop')
-      
-      combined_data_with_groups <- combined_data() %>%
-        left_join(summarized_data %>% select(week, group, mean_net_turns, sem), 
-                  by = c("week", "group"))
-      
-      return(list(analysis = combined_data_with_groups))
+        summarise(n              = dplyr::n(),
+                  sem            = sem_func(mean_net_turns),
+                  mean_net_turns = mean(mean_net_turns, na.rm = TRUE),
+                  .groups = "drop") %>%
+        select(week, group, n, mean_net_turns, sem)
+
+      # Group mean at each minute, for the time-course figure. Here each animal
+      # does contribute one observation per minute, so the SEM is across animals.
+      per_minute <- d %>%
+        group_by(week, group, min) %>%
+        summarise(mean_net_turns = mean(net_turns, na.rm = TRUE),
+                  sem = sem_func(net_turns),
+                  .groups = "drop")
+
+      return(list(per_animal = per_animal,
+                  per_group  = per_group,
+                  per_minute = per_minute))
     }
   })
   
   
+  # ---- Per-week group comparison (analysis mode) --------------------------
+  # Each week is tested on its own, on the per-animal means. The test is chosen
+  # from the data, matching the rule allocatoR uses and extending it to more
+  # than two groups.
+  analysis_stats <- reactive({
+    if (input$mode != "analysis") return(NULL)
+    res <- user_groups()
+    if (is.null(res$per_animal)) return(NULL)
+
+    d <- droplevels(res$per_animal)
+    if (nlevels(d$group) < 2) return(NULL)
+
+    rows <- lapply(levels(d$week), function(w) {
+      wk <- droplevels(d[d$week == w, , drop = FALSE])
+      # every group needs at least two animals for any of these tests
+      if (nlevels(wk$group) < 2 || any(table(wk$group) < 2)) return(NULL)
+
+      # Normality is checked on the within-group residuals, which is the
+      # assumption the t-test and ANOVA actually make -- not on the raw values,
+      # which are a mixture of the group means.
+      resid <- wk$mean_net_turns - ave(wk$mean_net_turns, wk$group, FUN = mean)
+      normal <- tryCatch(stats::shapiro.test(resid)$p.value >= 0.05,
+                         error = function(e) TRUE)
+      equal_var <- tryCatch(levene_test(wk, mean_net_turns ~ group)$p >= 0.05,
+                            error = function(e) TRUE)
+      two <- nlevels(wk$group) == 2
+
+      tag <- function(result, label) { result$method <- label; result }
+
+      tst <- tryCatch({
+        if (!normal && two) {
+          tag(wilcox_test(wk, mean_net_turns ~ group), "Wilcoxon rank-sum")
+        } else if (!normal) {
+          tag(dunn_test(wk, mean_net_turns ~ group, p.adjust.method = "BH"),
+              "Dunn (BH-adjusted)")
+        } else if (two) {
+          tag(t_test(wk, mean_net_turns ~ group, var.equal = equal_var),
+              if (equal_var) "Student's t-test" else "Welch's t-test")
+        } else if (equal_var) {
+          tag(tukey_hsd(wk, mean_net_turns ~ group), "ANOVA + Tukey HSD")
+        } else {
+          tag(games_howell_test(wk, mean_net_turns ~ group), "Games-Howell")
+        }
+      }, error = function(e) NULL)
+      if (is.null(tst) || nrow(tst) == 0) return(NULL)
+
+      # methods differ in whether they report a raw or an adjusted p
+      pval <- if ("p.adj" %in% names(tst)) tst$p.adj else tst$p
+
+      # stack the brackets above the data within this week
+      ymax <- max(wk$mean_net_turns, na.rm = TRUE)
+      step <- 0.10 * max(ymax, 1)
+
+      data.frame(
+        week       = w,
+        group1     = as.character(tst$group1),
+        group2     = as.character(tst$group2),
+        p          = as.numeric(pval),
+        method     = as.character(tst$method),
+        y.position = ymax + step * seq_len(nrow(tst)),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    out <- bind_rows(rows)
+    if (nrow(out) == 0) return(NULL)
+    out$week    <- factor(out$week, levels = levels(d$week))
+    out$p.label <- ifelse(out$p < 0.001, "<0.001", sprintf("%.3f", out$p))
+    out
+  })
+
+  # Plain-language report of which test was applied to each week
+  output$analysis_tests <- renderText({
+    if (input$mode != "analysis") return(invisible(NULL))
+    st <- analysis_stats()
+    if (is.null(st)) {
+      return(paste("No group comparison available. Each week needs at least two",
+                   "groups with two or more animals each."))
+    }
+    per_week <- st[!duplicated(st$week), c("week", "method")]
+    paste0(
+      "Group comparison within each week\n",
+      paste(sprintf("  %-10s %s", as.character(per_week$week), per_week$method),
+            collapse = "\n"),
+      "\n\nTest chosen per week from the within-group residuals (Shapiro-Wilk)",
+      "\nand the variance across groups (Levene)."
+    )
+  })
+
   # Conditional UI for showing the allocation table only after processing
   output$allocation_table_ui <- renderUI({
+    req(input$mode == "allocation")
     req(input$process_data)
     tableOutput("allocation_table")
   })
@@ -370,13 +538,93 @@ server <- function(input, output, session) {
     req(user_groups())
     user_groups()$summarized
   })
+
+  # Analysis summary: one row per week and group
+  output$analysis_table_ui <- renderUI({
+    req(input$mode == "analysis")
+    req(input$process_data_analysis)
+    tableOutput("analysis_table")
+  })
+
+  output$analysis_table <- renderTable({
+    req(user_groups()$per_group)
+    user_groups()$per_group %>%
+      mutate(week = as.character(week), group = as.character(group))
+  })
+
+  # Download the analysis summary, with the per-week test results appended
+  output$download_analysis <- downloadHandler(
+    filename = function() paste0("analysis_summary_", Sys.Date(), ".csv"),
+    content = function(file) {
+      g <- isolate(user_groups()$per_group)
+      validate(need(!is.null(g), "Process the data first."))
+
+      summary_rows <- g %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+      con <- file(file, open = "w")
+      on.exit(close(con), add = TRUE)
+      writeLines("# Group summary (mean and SEM across animals)", con)
+      utils::write.csv(summary_rows, con, row.names = FALSE, quote = TRUE)
+
+      st <- isolate(analysis_stats())
+      if (!is.null(st)) {
+        writeLines("", con)
+        writeLines("# Per-week group comparison", con)
+        utils::write.csv(
+          st[, c("week", "group1", "group2", "p", "method")] %>%
+            mutate(p = round(p, 5)),
+          con, row.names = FALSE, quote = TRUE)
+      }
+    }
+  )
   
   # ---- Figures -----------------------------------------------------------
   # Each figure is built exactly once here and consumed by both the on-screen
   # output and the PDF download, so a downloaded file can never drift from the
   # figure that was reviewed on screen.
 
+  #Anchor the y axis at zero only when every value is non-negative. Real Fusion
+  #exports do contain animals with a negative mean net turns, and a hard
+  #limits = c(0, ...) dropped them from the figure entirely: they stayed in the
+  #allocation table but vanished from the plot, and the violin was then shaped
+  #by the remaining animals only.
+  zero_anchored_y <- function(values) {
+    if (min(values, na.rm = TRUE) >= 0) {
+      #sits exactly on zero, as before
+      scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, NA))
+    } else {
+      #negatives present: let the axis find its own range rather than clip them
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+    }
+  }
+
+  #colours for a set of group levels
+  group_colors <- function(groups) setNames(pal[seq_along(groups)], groups)
+
   plot1_obj <- reactive({
+    if (input$mode == "analysis") {
+      d <- user_groups()$per_minute
+      if (is.null(d)) return(NULL)
+      groups <- levels(d$group)
+
+      return(
+        ggplot(d, aes(x = min, y = mean_net_turns,
+                      color = group, fill = group)) +
+          geom_ribbon(aes(ymin = mean_net_turns - sem, ymax = mean_net_turns + sem),
+                      alpha = 0.2, color = NA) +
+          geom_line(linewidth = 0.6) +
+          facet_wrap(~week) +
+          scale_x_continuous(breaks = seq(0, max(d$min, na.rm = TRUE), by = 30)) +
+          scale_color_manual(values = group_colors(groups)) +
+          scale_fill_manual(values = group_colors(groups)) +
+          theme_1 +
+          labs(x = "Time (min)", y = "  Net turns \n (per min)",
+               title = "Fig 1. Session time course (mean \u00b1 SEM across animals)") +
+          theme(legend.position = "bottom")
+      )
+    }
+
     if (input$mode != "allocation") return(NULL)
     original_data <- user_groups()$original
     if (!all(c("min", "net_turns", "id", "group") %in% colnames(original_data))) return(NULL)
@@ -399,6 +647,35 @@ server <- function(input, output, session) {
   })
 
   plot2_obj <- reactive({
+    if (input$mode == "analysis") {
+      d <- user_groups()$per_animal
+      if (is.null(d)) return(NULL)
+      groups <- levels(droplevels(d$group))
+
+      p <- ggplot(d, aes(x = group, y = mean_net_turns)) +
+        geom_violin(aes(fill = group), color = "black") +
+        geom_point(position = position_jitter(width = 0.15),
+                   size = 2.5, shape = 21, stroke = 0.2,
+                   fill = "white", color = "black") +
+        #free_y would hide between-week differences, which are the point of
+        #this figure, so the weeks deliberately share one scale
+        facet_wrap(~week) +
+        scale_fill_manual(values = group_colors(groups)) +
+        scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+        theme_1 +
+        labs(x = "Group", y = "Mean net turns",
+             title = "Fig 2. Group comparison within each week") +
+        theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              legend.position = "none")
+
+      st <- analysis_stats()
+      if (!is.null(st)) {
+        p <- p + add_pvalue(st, label = "p.label",
+                            bracket.size = 0.4, label.size = 3)
+      }
+      return(p)
+    }
+
     if (input$mode != "allocation") return(NULL)
     summarized_data <- user_groups()$summarized
     if (!all(c("mean_net_turns", "group") %in% colnames(summarized_data))) return(NULL)
@@ -413,14 +690,37 @@ server <- function(input, output, session) {
       geom_point(position = position_jitter(width = 0.2),
                  size = 4, shape = 21, stroke = 0.2,
                  fill = "white", color = "black", alpha = 0.8) +
-      scale_y_continuous(expand = c(0, 0),
-                         limits = c(0, 1.2 * max(summarized_data$mean_net_turns))) +
+      zero_anchored_y(summarized_data$mean_net_turns) +
       scale_fill_manual(values = setNames(colors, unique_groups)) +
       theme_1 +
       labs(x = "Group", y = "Mean net turns", title = "Fig 2. Allocation groups")
   })
 
   plot3_obj <- reactive({
+    if (input$mode == "analysis") {
+      g  <- user_groups()$per_group
+      pa <- user_groups()$per_animal
+      if (is.null(g)) return(NULL)
+      groups <- levels(droplevels(g$group))
+
+      return(
+        ggplot(g, aes(x = week, y = mean_net_turns,
+                      color = group, group = group)) +
+          #faint per-animal trajectories behind the group means, so individual
+          #responders are visible rather than averaged away
+          geom_line(data = pa, aes(group = id), alpha = 0.25, linewidth = 0.3) +
+          geom_errorbar(aes(ymin = mean_net_turns - sem, ymax = mean_net_turns + sem),
+                        width = 0.12, linewidth = 0.5) +
+          geom_line(linewidth = 0.8) +
+          geom_point(size = 3) +
+          scale_color_manual(values = group_colors(groups)) +
+          theme_1 +
+          labs(x = "Week", y = "Mean net turns",
+               title = "Fig 3. Response over weeks (mean \u00b1 SEM across animals)") +
+          theme(legend.position = "bottom")
+      )
+    }
+
     if (input$mode != "allocation") return(NULL)
     summarized_data <- user_groups()$summarized
     if (!all(c("mean_net_turns", "lesion") %in% colnames(summarized_data))) return(NULL)
@@ -430,8 +730,7 @@ server <- function(input, output, session) {
       geom_point(aes(fill = lesion),
                  position = position_jitter(width = 0.2),
                  size = 4, shape = 21, stroke = 0.2, color = "black") +
-      scale_y_continuous(expand = c(0, 0),
-                         limits = c(0, 1.2 * max(summarized_data$mean_net_turns))) +
+      zero_anchored_y(summarized_data$mean_net_turns) +
       # named so the colours stay attached to the right bin even when a
       # category happens to be empty
       scale_fill_manual(values = c(low = "#DBF227", mid = "#9FC131", high = "#005C53")) +
@@ -451,23 +750,40 @@ server <- function(input, output, session) {
   lapply(figure_buttons, shinyjs::disable)
   observeEvent(plot1_obj(), lapply(figure_buttons, shinyjs::enable), ignoreNULL = TRUE)
 
-  #build a PDF download handler for a given figure and page size
-  pdf_download <- function(prefix, plot_reactive, width, height) {
+  #the figures mean different things in the two modes, so the exported file
+  #name and page size follow the mode rather than the button
+  fig_meta <- function(index) {
+    if (input$mode == "analysis") {
+      list(prefix = c("session_time_course", "group_comparison",
+                      "response_over_weeks")[index],
+           width  = c(9, 8, 6)[index],
+           height = c(5, 5, 4)[index])
+    } else {
+      list(prefix = c("continuous_data_plot", "allocation_groups",
+                      "lesion_results")[index],
+           width  = c(8, 4, 3)[index],
+           height = c(6, 3, 3)[index])
+    }
+  }
+
+  #build a PDF download handler for a given figure
+  pdf_download <- function(index, plot_reactive) {
     downloadHandler(
-      filename = function() paste0(prefix, "_", Sys.Date(), ".pdf"),
+      filename = function() paste0(fig_meta(index)$prefix, "_", Sys.Date(), ".pdf"),
       content = function(file) {
         p <- isolate(plot_reactive())
         validate(need(!is.null(p),
                       "Nothing to download yet - process the data first."))
+        m <- isolate(fig_meta(index))
         ggsave(file, plot = p, device = "pdf",
-               width = width, height = height, units = "in")
+               width = m$width, height = m$height, units = "in")
       }
     )
   }
 
-  output$downloadData1 <- pdf_download("continuous_data_plot", plot1_obj, 8, 6)
-  output$downloadData2 <- pdf_download("allocation_groups",    plot2_obj, 4, 3)
-  output$downloadData3 <- pdf_download("lesion_results",       plot3_obj, 3, 3)
+  output$downloadData1 <- pdf_download(1, plot1_obj)
+  output$downloadData2 <- pdf_download(2, plot2_obj)
+  output$downloadData3 <- pdf_download(3, plot3_obj)
 
   # Download allocation table as CSV
   output$download_allocation <- downloadHandler(
